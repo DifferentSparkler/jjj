@@ -1,0 +1,154 @@
+name: Daily Auto joey Release
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # 每天 UTC 00:00 运行
+  workflow_dispatch:
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # 步骤1: 获取时间戳
+      - name: Get current UTC timestamp
+        run: |
+          set -euxo pipefail
+          echo "DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+          echo "TAG_DATE=$(date -u +'%Y.%m.%d-%H%M%S')" >> $GITHUB_ENV
+
+      # 步骤2: 下载并解压 cfnew 仓库到 /tmp
+      - name: Download and extract cfnew repo
+        run: |
+          set -euxo pipefail
+          echo "正在下载 https://codeload.github.com/byJoey/cfnew/zip/refs/heads/main..."
+          curl -L --fail --show-error -o /tmp/repo.zip "https://codeload.github.com/byJoey/cfnew/zip/refs/heads/main"
+
+          echo "正在解压..."
+          rm -rf /tmp/source
+          mkdir -p /tmp/source
+          unzip -q /tmp/repo.zip -d /tmp/source
+
+          SRC_ROOT=$(find /tmp/source -maxdepth 1 -mindepth 1 -type d -print -quit)
+          echo "SRC_ROOT=$SRC_ROOT" >> $GITHUB_ENV
+          echo "源码根目录: $SRC_ROOT"
+          ls -la "$SRC_ROOT"
+
+      # 步骤3: 先同步仓库其他文件（这一步不能放在生成 _worker.js 之后）
+      # 关键修复：--exclude='wrangler.toml' 防止 --delete 把它删掉
+      - name: Sync other project files
+        run: |
+          set -euxo pipefail
+          SRC_ROOT="${{ env.SRC_ROOT }}"
+
+          rsync -av --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='backups' \
+            --exclude='.gitignore' \
+            --exclude='明文源吗' \
+            --exclude='wrangler.toml' \
+            "$SRC_ROOT"/ ./
+
+          echo "✅ 其他文件同步完成"
+          ls -la
+
+          echo "🔍 确认 wrangler.toml 是否还在:"
+          if [ -f wrangler.toml ]; then
+            echo "✅ wrangler.toml 存在"
+          else
+            echo "::error::❌ wrangler.toml 被误删了！"
+            exit 1
+          fi
+
+      # 步骤4: 处理「明文源吗」→ 替换字符集 → 输出为 _worker.js
+      - name: Process 明文源吗 into _worker.js
+        run: |
+          set -euxo pipefail
+          SRC_ROOT="${{ env.SRC_ROOT }}"
+
+          SRC_FILE="$SRC_ROOT/明文源吗"
+          if [ ! -f "$SRC_FILE" ]; then
+            echo "::error::❌ 找不到源码文件：明文源吗"
+            ls -la "$SRC_ROOT"
+            exit 1
+          fi
+          echo "✅ 找到源码文件: $SRC_FILE"
+
+          cp "$SRC_FILE" _worker.js
+
+          sed -i "s/const 赛博字符列表 = '[^']*';/const 赛博字符列表 = '01';/" _worker.js
+
+          echo "🔍 替换后的那一行:"
+          grep -n "赛博字符列表" _worker.js || echo "（未匹配到，请检查原文格式）"
+
+          echo "✅ 已生成 _worker.js"
+          ls -la _worker.js
+
+      # 步骤5: 备份 _worker.js 并保留最近10个
+      - name: Backup _worker.js and cleanup old backups
+        run: |
+          set -euxo pipefail
+          mkdir -p backups
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_NAME="${TIMESTAMP}_worker.js"
+          cp _worker.js "backups/${BACKUP_NAME}"
+          echo "✅ 新文件已备份为 backups/${BACKUP_NAME}"
+
+          mapfile -t sorted_files < <(find backups -maxdepth 1 -name "*.js" -printf '%T@ %p\n' | sort -k 1nr | cut -d ' ' -f 2-)
+          for ((i=10; i<${#sorted_files[@]}; i++)); do
+              f="${sorted_files[i]}"
+              [ -n "$f" ] && [ -f "$f" ] && rm -f "$f" && echo "已删除旧备份: $f"
+          done
+
+          echo "当前备份列表:"
+          ls -lt backups/
+
+      # 步骤6: 创建 Release
+      - name: Create GitHub Release and upload assets
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.TAG_DATE }}
+          name: "自动发布 ${{ env.DATE }}"
+          body: |
+            🔄 每日自动同步 byJoey/cfnew
+            📅 发布时间：${{ env.DATE }}
+
+            **本次发布基于工作流运行 #${{ github.run_number }}**
+            来源：https://github.com/byJoey/cfnew
+
+            ⚙️ 已处理：字符集 `01イウエオ...ABCDEF` → `01`，产物重命名为 `_worker.js`
+          artifacts: "_worker.js,backups/*"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          replacesArtifacts: true
+
+      # 步骤7: 提交更改（包含 wrangler.toml 保护性恢复）
+      - name: Commit and push changes
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 如果 wrangler.toml 丢失了，从 git 历史中恢复
+          if [ ! -f wrangler.toml ]; then
+            echo "⚠️ wrangler.toml 不存在，尝试从 git 历史恢复"
+            git checkout HEAD -- wrangler.toml || echo "::warning::恢复失败，请手动检查"
+          fi
+
+          git add -A
+          git add _worker.js backups/ wrangler.toml 2>/dev/null || true
+
+          COMMIT_MSG="🔄 自动同步 cfnew 于 ${{ env.DATE }} [skip ci]"
+          git commit -m "$COMMIT_MSG" || echo "没有变更需要提交"
+          git push origin HEAD:main
+          echo "✅ 已推送更改至 main 分支"
+        continue-on-error: true
