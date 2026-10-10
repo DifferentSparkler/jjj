@@ -131,24 +131,5 @@ jobs:
           allowUpdates: true
           replacesArtifacts: true
 
-      # 步骤7: 提交更改（包含 wrangler.toml 保护性恢复）
-      - name: Commit and push changes
-        run: |
-          set -euxo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 如果 wrangler.toml 丢失了，从 git 历史中恢复
-          if [ ! -f wrangler.toml ]; then
-            echo "⚠️ wrangler.toml 不存在，尝试从 git 历史恢复"
-            git checkout HEAD -- wrangler.toml || echo "::warning::恢复失败，请手动检查"
-          fi
-
-          git add -A
-          git add _worker.js backups/ wrangler.toml 2>/dev/null || true
-
-          COMMIT_MSG="🔄 自动同步 cfnew 于 ${{ env.DATE }} [skip ci]"
-          git commit -m "$COMMIT_MSG" || echo "没有变更需要提交"
-          git push origin HEAD:main
-          echo "✅ 已推送更改至 main 分支"
         continue-on-error: true
